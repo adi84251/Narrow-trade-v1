@@ -1,0 +1,736 @@
+# =============================================================================
+#  NARROW DIVERSION QUALITY DASHBOARD  |  Tata Steel - Naval Department
+#  Single-file Streamlit application
+#
+#  HOW TO RUN (on your own PC):
+#     1) pip install streamlit pandas numpy plotly openpyxl
+#     2) Put "Narrow_Diversion_Report_FY_25_26_27_-_Copy.xlsx" in the SAME
+#        folder as this app.py  (or just upload it from the sidebar)
+#     3) In a terminal, in that folder, run:
+#            streamlit run app.py
+#     4) It opens automatically at http://localhost:8501
+#
+#  The workbook is expected to contain 3 sheets per Financial Year:
+#     - "Trade Material For each customer month vise"  -> customer x month
+#     - "CUSTOMER & DEFECT WISE."                       -> defect x customer
+#     - "DEFECT & MONTH WISE."                          -> defect x month
+#  Sheet NAMES can vary slightly (spaces/hyphens) - the app detects the
+#  correct sheet automatically by reading the title in cell A1, and groups
+#  the 3 sheets belonging to the same FY using the year digits in the name.
+# =============================================================================
+
+import re
+import io
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+import openpyxl
+
+# -----------------------------------------------------------------------------
+# PAGE CONFIG & GLOBAL STYLE
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Narrow Diversion Quality Dashboard",
+    page_icon="⚙️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+PRIMARY = "#0B3D6E"      # steel navy
+ACCENT = "#E8720C"       # steel orange
+ACCENT2 = "#1F8A70"      # teal green
+GREY = "#6B7280"
+BG_CARD = "#FFFFFF"
+
+CUSTOM_CSS = f"""
+<style>
+    .stApp {{ background-color: #F4F6F9; }}
+    #MainMenu, footer {{visibility:hidden;}}
+
+    .db-header {{
+        background: linear-gradient(90deg, {PRIMARY} 0%, #14294D 100%);
+        padding: 22px 32px; border-radius: 14px; margin-bottom: 18px;
+        box-shadow: 0 4px 18px rgba(11,61,110,0.25);
+    }}
+    .db-header h1 {{
+        color: white; font-size: 30px; font-weight: 700; margin: 0;
+        letter-spacing: 0.3px;
+    }}
+    .db-header p {{
+        color: #CFE0F5; font-size: 14px; margin: 4px 0 0 0;
+    }}
+
+    div[data-testid="stMetric"] {{
+        background: {BG_CARD}; border-radius: 12px; padding: 14px 16px 8px 16px;
+        border: 1px solid #E3E8EF; box-shadow: 0 2px 8px rgba(16,24,40,0.05);
+    }}
+    div[data-testid="stMetricLabel"] {{ color: {GREY}; font-weight: 600; }}
+    div[data-testid="stMetricValue"] {{ color: {PRIMARY}; }}
+
+    .section-title {{
+        font-size: 19px; font-weight: 700; color: {PRIMARY};
+        border-left: 5px solid {ACCENT}; padding-left: 10px; margin: 18px 0 10px 0;
+    }}
+    .insight-box {{
+        background: #FFF6EC; border: 1px solid #F2D9B8; border-left: 5px solid {ACCENT};
+        border-radius: 10px; padding: 12px 16px; font-size: 14.5px; color: #4A3A1F;
+        margin-bottom: 14px;
+    }}
+    section[data-testid="stSidebar"] {{ background-color: #0F2A4A; }}
+    section[data-testid="stSidebar"] * {{ color: #E7EEF7 !important; }}
+    .stTabs [data-baseweb="tab-list"] {{ gap: 4px; }}
+    .stTabs [data-baseweb="tab"] {{
+        background: #E9EEF5; border-radius: 8px 8px 0 0; padding: 8px 16px; font-weight:600;
+    }}
+    .stTabs [aria-selected="true"] {{ background: {PRIMARY}; color: white !important; }}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+MONTHS_FISCAL = ["Apr", "May", "Jun", "Jul", "Aug", "Sep",
+                  "Oct", "Nov", "Dec", "Jan", "Feb", "Mar"]
+PARETO_COLORS = [PRIMARY, ACCENT, ACCENT2]
+
+
+# =============================================================================
+# PARSING ENGINE
+# =============================================================================
+def _norm(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def classify_sheets(wb):
+    """Group the workbook's sheets into {fy_label: {category: sheet_name}}"""
+    groups = {}
+    for name in wb.sheetnames:
+        ws = wb[name]
+        a1 = str(ws["A1"].value or "").lower()
+        digits = re.findall(r"\d+", name)
+        fy_key = "-".join(digits[:2]) if len(digits) >= 2 else name
+        fy_label = f"FY{fy_key}"
+
+        if "trade material" in a1:
+            cat = "production"
+        elif "defect" in a1 and "wise" in a1 and "month" not in a1:
+            cat = "customer_defect"
+        elif "defect" in a1 and "month" in a1:
+            cat = "defect_month"
+        else:
+            cat = None
+        if cat:
+            groups.setdefault(fy_label, {})[cat] = name
+    # keep only complete FY groups
+    return {k: v for k, v in groups.items() if len(v) == 3}
+
+
+def _rows(ws):
+    return [list(r) for r in ws.iter_rows(values_only=True)]
+
+
+STOP_WORDS = ("total", "wise", "defect", "customer", "grand", "(blank)")
+
+
+def parse_production(ws):
+    rows = _rows(ws)
+    header = rows[1]
+    total_col = trade_col = pct_col = None
+    for i, h in enumerate(header):
+        if h is None:
+            continue
+        hs = str(h).lower()
+        if "production total" in hs and total_col is None:
+            total_col = i
+        if "customer wise trade" in hs and "%" not in hs and trade_col is None:
+            trade_col = i
+        if "%" in hs and pct_col is None:
+            pct_col = i
+
+    month_recs, totals = [], []
+    for r in rows[2:]:
+        cust = r[0]
+        if cust is None:
+            break
+        cs = str(cust).strip()
+        if cs == "" or any(k in cs.lower() for k in STOP_WORDS):
+            break
+        for mi in range(12):
+            col = 1 + mi
+            if col >= len(r):
+                break
+            val = r[col]
+            if isinstance(val, (int, float)):
+                month_recs.append({"Customer": cs, "MonthIdx": mi,
+                                    "Month": MONTHS_FISCAL[mi], "Value": float(val)})
+        pt = r[total_col] if total_col is not None and total_col < len(r) else None
+        ct = r[trade_col] if trade_col is not None and trade_col < len(r) else None
+        pc = r[pct_col] if pct_col is not None and pct_col < len(r) else None
+        totals.append({
+            "Customer": cs,
+            "ProductionTotal": pt if isinstance(pt, (int, float)) else np.nan,
+            "CustomerTrade": ct if isinstance(ct, (int, float)) else np.nan,
+            "PctTrade": pc if isinstance(pc, (int, float)) else np.nan,
+        })
+    return pd.DataFrame(month_recs), pd.DataFrame(totals)
+
+
+def parse_customer_defect(ws):
+    rows = _rows(ws)
+    header = rows[1]
+    customers = []
+    for i, h in enumerate(header[1:], start=1):
+        if h is None:
+            continue
+        hs = str(h).strip()
+        if hs.lower() in ("grand total", "total"):
+            continue
+        customers.append((i, hs))
+
+    recs = []
+    for r in rows[2:]:
+        defect = r[0]
+        if defect is None:
+            continue
+        ds = str(defect).strip()
+        if ds == "" or ds.lower() in ("grand total", "total", "(blank)"):
+            continue
+        for i, cust in customers:
+            if i >= len(r):
+                continue
+            val = r[i]
+            if isinstance(val, (int, float)):
+                recs.append({"Defect": ds, "Customer": cust, "Value": float(val)})
+    return pd.DataFrame(recs)
+
+
+def parse_defect_month(ws):
+    rows = _rows(ws)
+    recs = []
+    for r in rows[2:]:
+        defect = r[0]
+        if defect is None:
+            continue
+        ds = str(defect).strip()
+        if ds == "" or ds.lower() in ("grand total", "total", "(blank)"):
+            continue
+        n_months = min(12, max(0, len(r) - 2))
+        for mi in range(n_months):
+            col = 1 + mi
+            val = r[col]
+            if isinstance(val, (int, float)):
+                recs.append({"Defect": ds, "MonthIdx": mi,
+                             "Month": MONTHS_FISCAL[mi], "Value": float(val)})
+    return pd.DataFrame(recs)
+
+
+def _cust_key(name):
+    """Normalized key used to match the same customer across sheets, since the
+    workbook spells/cases/truncates customer names differently in different
+    tables (e.g. 'KAPOOR STRIPS AND BLADES COMPA' vs '...COMPANY')."""
+    return re.sub(r"[^A-Z0-9]", "", str(name).upper())[:20]
+
+
+def unify_customer_names(*dfs):
+    """Pick one canonical (longest, then title-cased-preferred) display name
+    per normalized key, and rewrite the 'Customer' column consistently
+    across every dataframe passed in."""
+    all_names = pd.concat([d["Customer"] for d in dfs if "Customer" in d.columns], ignore_index=True)
+    key_df = pd.DataFrame({"Customer": all_names})
+    key_df["key"] = key_df["Customer"].map(_cust_key)
+    key_df["len"] = key_df["Customer"].str.len()
+    canonical = (key_df.sort_values("len", ascending=False)
+                 .drop_duplicates("key")
+                 .set_index("key")["Customer"].to_dict())
+    for d in dfs:
+        if "Customer" in d.columns:
+            d["Customer"] = d["Customer"].map(lambda c: canonical.get(_cust_key(c), c))
+    return dfs
+
+
+@st.cache_data(show_spinner="Reading & parsing workbook ...")
+def load_all(file_bytes):
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    groups = classify_sheets(wb)
+    if not groups:
+        return None
+
+    month_frames, totals_frames, cd_frames, dm_frames = [], [], [], []
+    for fy_label, sheets in groups.items():
+        m_df, t_df = parse_production(wb[sheets["production"]])
+        m_df["FY"] = fy_label
+        t_df["FY"] = fy_label
+        month_frames.append(m_df)
+        totals_frames.append(t_df)
+
+        cd_df = parse_customer_defect(wb[sheets["customer_defect"]])
+        cd_df["FY"] = fy_label
+        cd_frames.append(cd_df)
+
+        dm_df = parse_defect_month(wb[sheets["defect_month"]])
+        dm_df["FY"] = fy_label
+        dm_frames.append(dm_df)
+
+    df_month = pd.concat(month_frames, ignore_index=True)
+    df_totals = pd.concat(totals_frames, ignore_index=True)
+    df_cd = pd.concat(cd_frames, ignore_index=True)
+    df_dm = pd.concat(dm_frames, ignore_index=True)
+
+    # Unify customer spelling/casing/truncation across the three sheet types
+    # so filters, Pareto rankings and YoY comparisons all match correctly.
+    df_month, df_totals, df_cd = unify_customer_names(df_month, df_totals, df_cd)
+
+    fy_order = sorted(groups.keys(), key=lambda x: re.findall(r"\d+", x))
+    for d in (df_month, df_totals, df_cd, df_dm):
+        d["FY"] = pd.Categorical(d["FY"], categories=fy_order, ordered=True)
+
+    return {"month": df_month, "totals": df_totals, "cd": df_cd,
+            "dm": df_dm, "fy_order": fy_order}
+
+
+# =============================================================================
+# CHART HELPERS
+# =============================================================================
+def pareto_chart(df, cat_col, val_col, title, top_n=15):
+    g = df.groupby(cat_col, as_index=False)[val_col].sum().sort_values(val_col, ascending=False)
+    g = g.head(top_n).reset_index(drop=True)
+    g["Cumulative %"] = g[val_col].cumsum() / g[val_col].sum() * 100
+
+    fig = go.Figure()
+    fig.add_bar(x=g[cat_col], y=g[val_col], name="Diversion (T)",
+                marker_color=PRIMARY, yaxis="y1")
+    fig.add_trace(go.Scatter(x=g[cat_col], y=g["Cumulative %"], name="Cumulative %",
+                              mode="lines+markers", marker_color=ACCENT, yaxis="y2"))
+    fig.add_hline(y=80, line_dash="dot", line_color="red", yref="y2",
+                  annotation_text="80% line", annotation_position="top left")
+    fig.update_layout(
+        title=title, template="plotly_white", height=460,
+        yaxis=dict(title="Diversion (Tons)"),
+        yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 110]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(t=60, b=110),
+    )
+    fig.update_xaxes(tickangle=-40)
+    return fig, g
+
+
+def histogram_chart(values, title, color=PRIMARY):
+    fig = px.histogram(values, nbins=30, template="plotly_white",
+                        color_discrete_sequence=[color], marginal="box")
+    fig.update_layout(title=title, xaxis_title="Diversion Quantity (T)",
+                       yaxis_title="Frequency", showlegend=False, height=420)
+    return fig
+
+
+def control_chart(series_df, x_col, y_col, title):
+    d = series_df.sort_values(x_col).reset_index(drop=True)
+    x = d[y_col].values
+    xbar = np.mean(x)
+    if len(x) > 1:
+        mr = np.abs(np.diff(x))
+        mrbar = np.mean(mr)
+    else:
+        mrbar = 0
+    ucl = xbar + 2.66 * mrbar
+    lcl = max(xbar - 2.66 * mrbar, 0)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=d[x_col].astype(str), y=d[y_col], mode="lines+markers",
+                              name="Diversion", line=dict(color=PRIMARY, width=2.5)))
+    fig.add_hline(y=xbar, line_color=ACCENT2, line_dash="dash", annotation_text="Mean")
+    fig.add_hline(y=ucl, line_color="red", line_dash="dot", annotation_text="UCL")
+    fig.add_hline(y=lcl, line_color="red", line_dash="dot", annotation_text="LCL")
+    out_of_control = d[(d[y_col] > ucl) | (d[y_col] < lcl)]
+    if len(out_of_control):
+        fig.add_trace(go.Scatter(x=out_of_control[x_col].astype(str), y=out_of_control[y_col],
+                                  mode="markers", marker=dict(color="red", size=11, symbol="x"),
+                                  name="Out of control"))
+    fig.update_layout(title=title, template="plotly_white", height=430,
+                       xaxis_title="Period", yaxis_title="Diversion (T)")
+    return fig
+
+
+def heatmap_chart(df, row_col, col_col, val_col, title, col_order=None):
+    piv = df.pivot_table(index=row_col, columns=col_col, values=val_col, aggfunc="sum", fill_value=0)
+    if col_order:
+        piv = piv.reindex(columns=[c for c in col_order if c in piv.columns])
+    piv = piv.loc[piv.sum(axis=1).sort_values(ascending=False).index]
+    fig = px.imshow(piv, aspect="auto", color_continuous_scale="Blues",
+                     labels=dict(color="Tons"))
+    fig.update_layout(title=title, template="plotly_white", height=max(420, 22 * len(piv)))
+    return fig
+
+
+# =============================================================================
+# SIDEBAR - DATA SOURCE
+# =============================================================================
+st.sidebar.markdown("## ⚙️ Data Source")
+DEFAULT_NAME = "Narrow_Diversion_Report_FY_25_26_27_-_Copy.xlsx"
+
+uploaded = st.sidebar.file_uploader("Upload the Narrow Diversion Report (.xlsx)", type=["xlsx"])
+file_bytes = None
+if uploaded is not None:
+    file_bytes = uploaded.read()
+else:
+    try:
+        with open(DEFAULT_NAME, "rb") as f:
+            file_bytes = f.read()
+        st.sidebar.success(f"Loaded local file: {DEFAULT_NAME}")
+    except FileNotFoundError:
+        st.sidebar.info("Upload your Excel report to begin, or place it next to app.py.")
+
+if file_bytes is None:
+    st.markdown('<div class="db-header"><h1>⚙️ Narrow Diversion Quality Dashboard</h1>'
+                '<p>Tata Steel — Naval Department | Waiting for data file...</p></div>',
+                unsafe_allow_html=True)
+    st.stop()
+
+data = load_all(file_bytes)
+if data is None:
+    st.error("Could not detect the expected sheet structure in this workbook. "
+             "Please check that each FY has 3 sheets: 'Trade Material...', "
+             "'CUSTOMER & DEFECT WISE.', and 'DEFECT & MONTH WISE.'")
+    st.stop()
+
+df_month, df_totals, df_cd, df_dm = data["month"], data["totals"], data["cd"], data["dm"]
+FY_ORDER = data["fy_order"]
+
+# =============================================================================
+# SIDEBAR - FILTERS
+# =============================================================================
+st.sidebar.markdown("## 🔎 Filters")
+sel_fy = st.sidebar.multiselect("Financial Year", FY_ORDER, default=FY_ORDER)
+
+all_customers = sorted(df_month["Customer"].unique().tolist())
+sel_customers = st.sidebar.multiselect("Customer", all_customers, default=[])
+
+all_defects = sorted(df_dm["Defect"].unique().tolist())
+sel_defects = st.sidebar.multiselect("Defect", all_defects, default=[])
+
+top_n = st.sidebar.slider("Top-N items in Pareto / rankings", 5, 30, 15)
+
+st.sidebar.markdown("---")
+st.sidebar.caption("Built for Naval Department Quality Review • Data refreshes "
+                    "automatically when you upload a new workbook.")
+
+# apply filters
+f_month = df_month[df_month["FY"].isin(sel_fy)]
+f_totals = df_totals[df_totals["FY"].isin(sel_fy)]
+f_cd = df_cd[df_cd["FY"].isin(sel_fy)]
+f_dm = df_dm[df_dm["FY"].isin(sel_fy)]
+
+if sel_customers:
+    f_month = f_month[f_month["Customer"].isin(sel_customers)]
+    f_totals = f_totals[f_totals["Customer"].isin(sel_customers)]
+    f_cd = f_cd[f_cd["Customer"].isin(sel_customers)]
+
+if sel_defects:
+    f_cd = f_cd[f_cd["Defect"].isin(sel_defects)]
+    f_dm = f_dm[f_dm["Defect"].isin(sel_defects)]
+
+# =============================================================================
+# HEADER
+# =============================================================================
+st.markdown(
+    f"""<div class="db-header">
+    <h1>⚙️ Narrow Diversion Quality Dashboard</h1>
+    <p>Tata Steel — Naval Department &nbsp;|&nbsp; Customer • Defect • Month-wise Diversion Analysis
+    &nbsp;|&nbsp; Generated {datetime.now().strftime('%d %b %Y, %H:%M')}</p>
+    </div>""", unsafe_allow_html=True)
+
+# =============================================================================
+# KPI ROW
+#
+# IMPORTANT DATA SEMANTICS (verified against the workbook):
+#   - The Customer x Month sheet ("df_month") holds MONTHLY PRODUCTION volume
+#     per customer (it sums exactly to "ProductionTotal").
+#   - The actual DIVERTED / DEFECTIVE quantity ("Narrow Diversion") lives in
+#     the Customer-Defect sheet (df_cd) and the Defect-Month sheet (df_dm),
+#     both of which sum exactly to "CustomerTrade" in the totals table.
+#   All diversion / quality KPIs below use df_dm / df_cd / CustomerTrade, while
+#   df_month is used only for production-volume context.
+# =============================================================================
+total_diversion = f_dm["Value"].sum()
+total_production = f_totals.drop_duplicates(subset=["Customer", "FY"])["ProductionTotal"].sum()
+diversion_pct = (total_diversion / total_production * 100) if total_production else 0
+n_customers = f_month["Customer"].nunique()
+n_defects = f_dm["Defect"].nunique()
+
+top_defect_row = f_dm.groupby("Defect")["Value"].sum().sort_values(ascending=False)
+top_defect = top_defect_row.index[0] if len(top_defect_row) else "-"
+top_defect_val = top_defect_row.iloc[0] if len(top_defect_row) else 0
+
+top_cust_row = f_cd.groupby("Customer")["Value"].sum().sort_values(ascending=False)
+top_cust = top_cust_row.index[0] if len(top_cust_row) else "-"
+
+yoy_txt = "—"
+fy_totals_series = f_dm.groupby("FY", observed=True)["Value"].sum().reindex(FY_ORDER).dropna()
+if len(fy_totals_series) >= 2:
+    last, prev = fy_totals_series.iloc[-1], fy_totals_series.iloc[-2]
+    if prev:
+        chg = (last - prev) / prev * 100
+        yoy_txt = f"{chg:+.1f}%"
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Total Diversion", f"{total_diversion:,.1f} T")
+c2.metric("Total Production", f"{total_production:,.1f} T")
+c3.metric("Diversion %", f"{diversion_pct:,.2f}%")
+c4.metric("Active Customers", f"{n_customers}")
+c5.metric("Defect Types", f"{n_defects}")
+c6.metric("Latest YoY Δ", yoy_txt)
+
+st.markdown(
+    f'<div class="insight-box">📌 <b>Top defect:</b> {top_defect} '
+    f'({top_defect_val:,.1f} T) &nbsp;|&nbsp; <b>Top diverting customer:</b> {top_cust} '
+    f'&nbsp;|&nbsp; Use the sidebar to filter by Financial Year, Customer or Defect.</div>',
+    unsafe_allow_html=True,
+)
+
+# =============================================================================
+# TABS
+# =============================================================================
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📊 Executive Overview", "📉 Pareto Analysis", "🧪 Defect Quality Analysis",
+     "🏭 Customer Analysis", "📈 Trend & Control Charts", "🗂️ Data Explorer"]
+)
+
+# ------------------------------------------------------------------ TAB 1 ---
+with tab1:
+    st.markdown('<div class="section-title">Diversion Trend Across Financial Years</div>',
+                unsafe_allow_html=True)
+    trend = f_dm.groupby(["FY", "MonthIdx", "Month"], observed=True, as_index=False)["Value"].sum()
+    trend = trend.sort_values(["FY", "MonthIdx"])
+    fig_trend = px.line(trend, x="Month", y="Value", color="FY", markers=True,
+                         category_orders={"Month": MONTHS_FISCAL},
+                         color_discrete_sequence=PARETO_COLORS, template="plotly_white")
+    fig_trend.update_layout(title="Monthly Diverted / Defective Quantity by Financial Year (Apr–Mar cycle)",
+                             yaxis_title="Diversion (T)", height=440)
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown('<div class="section-title">Year-over-Year Total Diversion</div>',
+                    unsafe_allow_html=True)
+        yoy_df = f_dm.groupby("FY", observed=True, as_index=False)["Value"].sum()
+        fig_yoy = px.bar(yoy_df, x="FY", y="Value", text_auto=".1f",
+                          color="FY", color_discrete_sequence=PARETO_COLORS,
+                          template="plotly_white")
+        fig_yoy.update_layout(showlegend=False, height=380, yaxis_title="Diversion (T)")
+        st.plotly_chart(fig_yoy, use_container_width=True)
+    with colB:
+        st.markdown('<div class="section-title">Defect Share (Treemap)</div>',
+                    unsafe_allow_html=True)
+        tv = f_dm.groupby(["FY", "Defect"], observed=True, as_index=False)["Value"].sum()
+        tv = tv[tv["Value"] > 0]
+        fig_tree = px.treemap(tv, path=["FY", "Defect"], values="Value",
+                               color="Value", color_continuous_scale="Blues")
+        fig_tree.update_layout(height=380, margin=dict(t=10, l=0, r=0, b=0))
+        st.plotly_chart(fig_tree, use_container_width=True)
+
+    st.markdown('<div class="section-title">Diversion % of Production — Year-over-Year</div>',
+                unsafe_allow_html=True)
+    prod_by_fy = f_totals.drop_duplicates(subset=["Customer", "FY"]).groupby(
+        "FY", observed=True)["ProductionTotal"].sum()
+    div_by_fy = f_dm.groupby("FY", observed=True)["Value"].sum()
+    rate_df = pd.DataFrame({"Production": prod_by_fy, "Diversion": div_by_fy}).dropna()
+    rate_df["Diversion %"] = rate_df["Diversion"] / rate_df["Production"] * 100
+    rate_df = rate_df.reset_index()
+    fig_rate = px.bar(rate_df, x="FY", y="Diversion %", text_auto=".2f",
+                       color_discrete_sequence=[ACCENT], template="plotly_white")
+    fig_rate.update_layout(height=360, yaxis_title="Diversion % of Production")
+    st.plotly_chart(fig_rate, use_container_width=True)
+    st.caption("Diversion % = actual diverted/defective quantity ÷ total production for that FY — "
+               "this normalized rate is the key quality KPI since it accounts for changing production volume.")
+
+# ------------------------------------------------------------------ TAB 2 ---
+with tab2:
+    st.markdown('<div class="section-title">Pareto Analysis — Defects (Vital Few vs Trivial Many)</div>',
+                unsafe_allow_html=True)
+    if len(f_dm):
+        fig_p1, g1 = pareto_chart(f_dm, "Defect", "Value", "Defect Pareto Chart", top_n)
+        st.plotly_chart(fig_p1, use_container_width=True)
+        vital_few = g1[g1["Cumulative %"] <= 80]
+        n_vital = max(len(vital_few), 1)
+        st.markdown(
+            f'<div class="insight-box">📌 The top <b>{n_vital}</b> defect(s) out of '
+            f'{f_dm["Defect"].nunique()} account for ~80% of total diversion — '
+            f'prioritize these for root-cause correction (classic 80/20 rule).</div>',
+            unsafe_allow_html=True)
+    else:
+        st.info("No defect data available for current filters.")
+
+    st.markdown('<div class="section-title">Pareto Analysis — Customers (by Diverted Quantity)</div>',
+                unsafe_allow_html=True)
+    if len(f_cd):
+        fig_p2, g2 = pareto_chart(f_cd, "Customer", "Value", "Customer Pareto Chart", top_n)
+        st.plotly_chart(fig_p2, use_container_width=True)
+    else:
+        st.info("No customer-defect data available for current filters.")
+
+# ------------------------------------------------------------------ TAB 3 ---
+with tab3:
+    st.markdown('<div class="section-title">Distribution of Diversion Quantities (Histogram)</div>',
+                unsafe_allow_html=True)
+    if len(f_dm):
+        st.plotly_chart(histogram_chart(f_dm["Value"], "Histogram — Defect-wise Diversion Records"),
+                         use_container_width=True)
+    colC, colD = st.columns(2)
+    with colC:
+        st.markdown('<div class="section-title">Defect × Month Heatmap</div>', unsafe_allow_html=True)
+        if len(f_dm):
+            st.plotly_chart(
+                heatmap_chart(f_dm, "Defect", "Month", "Value", "Defect vs Month Intensity",
+                              col_order=MONTHS_FISCAL),
+                use_container_width=True)
+    with colD:
+        st.markdown('<div class="section-title">Spread by Top Defects (Box Plot)</div>',
+                    unsafe_allow_html=True)
+        if len(f_dm):
+            top_defects_list = f_dm.groupby("Defect")["Value"].sum().sort_values(
+                ascending=False).head(top_n).index.tolist()
+            box_df = f_dm[f_dm["Defect"].isin(top_defects_list)]
+            fig_box = px.box(box_df, x="Defect", y="Value", color="Defect",
+                              template="plotly_white", points="all")
+            fig_box.update_layout(showlegend=False, height=480, xaxis_title="")
+            fig_box.update_xaxes(tickangle=-40)
+            st.plotly_chart(fig_box, use_container_width=True)
+
+    st.markdown('<div class="section-title">Defect Ranking Table</div>', unsafe_allow_html=True)
+    if len(f_dm):
+        rank_tbl = f_dm.groupby("Defect", as_index=False)["Value"].sum().sort_values(
+            "Value", ascending=False)
+        rank_tbl["Share %"] = rank_tbl["Value"] / rank_tbl["Value"].sum() * 100
+        rank_tbl["Cumulative %"] = rank_tbl["Share %"].cumsum()
+        rank_tbl.columns = ["Defect", "Total Diversion (T)", "Share %", "Cumulative %"]
+        st.dataframe(rank_tbl.style.format({"Total Diversion (T)": "{:,.2f}",
+                                             "Share %": "{:.1f}%",
+                                             "Cumulative %": "{:.1f}%"}),
+                     use_container_width=True, height=360)
+
+# ------------------------------------------------------------------ TAB 4 ---
+with tab4:
+    st.markdown('<div class="section-title">Customer-wise Diversion & Trade %</div>',
+                unsafe_allow_html=True)
+    if len(f_totals):
+        cust_summary = f_totals.groupby("Customer", as_index=False).agg(
+            ProductionTotal=("ProductionTotal", "sum"),
+            CustomerTrade=("CustomerTrade", "sum"))
+        cust_summary["PctTrade"] = np.where(cust_summary["ProductionTotal"] > 0,
+                                             cust_summary["CustomerTrade"] / cust_summary["ProductionTotal"] * 100, 0)
+        cust_summary = cust_summary.sort_values("CustomerTrade", ascending=False).head(top_n)
+
+        fig_cust = go.Figure()
+        fig_cust.add_bar(x=cust_summary["Customer"], y=cust_summary["ProductionTotal"],
+                          name="Total Production", marker_color="#B7C6DA")
+        fig_cust.add_bar(x=cust_summary["Customer"], y=cust_summary["CustomerTrade"],
+                          name="Diverted Qty", marker_color=ACCENT)
+        fig_cust.update_layout(barmode="overlay", template="plotly_white", height=460,
+                                title="Production vs Diverted Quantity by Customer",
+                                yaxis_title="Tons")
+        fig_cust.update_xaxes(tickangle=-40)
+        st.plotly_chart(fig_cust, use_container_width=True)
+
+        fig_pct = px.bar(cust_summary.sort_values("PctTrade", ascending=True),
+                          x="PctTrade", y="Customer", orientation="h",
+                          color="PctTrade", color_continuous_scale="Oranges",
+                          template="plotly_white")
+        fig_pct.update_layout(title="% of Production Diverted, by Customer",
+                               height=max(420, 24 * len(cust_summary)), xaxis_title="% Diverted")
+        st.plotly_chart(fig_pct, use_container_width=True)
+
+    st.markdown('<div class="section-title">Customer Diversion — Year-over-Year Comparison</div>',
+                unsafe_allow_html=True)
+    if len(f_totals):
+        yoy_cust = f_totals.groupby(["Customer", "FY"], observed=True, as_index=False)["CustomerTrade"].sum()
+        top_cust_list = f_cd.groupby("Customer")["Value"].sum().sort_values(ascending=False).head(top_n).index.tolist()
+        yoy_cust = yoy_cust[yoy_cust["Customer"].isin(top_cust_list)]
+        fig_yoy_cust = px.bar(yoy_cust, x="Customer", y="CustomerTrade", color="FY", barmode="group",
+                               color_discrete_sequence=PARETO_COLORS, template="plotly_white")
+        fig_yoy_cust.update_layout(title="Diverted Quantity by Customer, Year-over-Year",
+                                    height=440, yaxis_title="Diversion (T)")
+        fig_yoy_cust.update_xaxes(tickangle=-40)
+        st.plotly_chart(fig_yoy_cust, use_container_width=True)
+
+    st.markdown('<div class="section-title">Customer × Month — Production Volume Heatmap</div>',
+                unsafe_allow_html=True)
+    st.caption("Note: month-wise granularity is only available for total production volume in the "
+               "source workbook, not for diverted quantity. This heatmap gives production-pattern context.")
+    if len(f_month):
+        st.plotly_chart(
+            heatmap_chart(f_month, "Customer", "Month", "Value", "Customer vs Month Production Volume",
+                          col_order=MONTHS_FISCAL),
+            use_container_width=True)
+
+    if len(f_cd):
+        st.markdown('<div class="section-title">Which Defects Hit Which Customers</div>',
+                    unsafe_allow_html=True)
+        fig_cd = px.sunburst(f_cd, path=["Customer", "Defect"], values="Value",
+                              color="Value", color_continuous_scale="Blues")
+        fig_cd.update_layout(height=560, margin=dict(t=10, l=0, r=0, b=0))
+        st.plotly_chart(fig_cd, use_container_width=True)
+
+# ------------------------------------------------------------------ TAB 5 ---
+with tab5:
+    st.markdown('<div class="section-title">Statistical Process Control — Monthly Diversion (I-Chart)</div>',
+                unsafe_allow_html=True)
+    spc_series = f_dm.groupby(["FY", "MonthIdx", "Month"], observed=True, as_index=False)["Value"].sum()
+    spc_series = spc_series.sort_values(["FY", "MonthIdx"])
+    spc_series["Period"] = spc_series["FY"].astype(str) + "-" + spc_series["Month"]
+    if len(spc_series) > 1:
+        st.plotly_chart(control_chart(spc_series, "Period", "Value",
+                                       "Individuals Control Chart — Total Monthly Diversion"),
+                         use_container_width=True)
+        st.markdown(
+            '<div class="insight-box">📌 Points beyond the red UCL/LCL lines (marked ✕) '
+            'indicate months where diversion behaved abnormally vs. the process average — '
+            'worth a focused review.</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-title">Seasonality — Average Diversion by Month</div>',
+                unsafe_allow_html=True)
+    season = f_dm.groupby("Month", as_index=False)["Value"].mean()
+    season["Month"] = pd.Categorical(season["Month"], categories=MONTHS_FISCAL, ordered=True)
+    season = season.sort_values("Month")
+    fig_season = px.bar(season, x="Month", y="Value", template="plotly_white",
+                         color="Value", color_continuous_scale="Teal")
+    fig_season.update_layout(title="Average Diversion by Calendar Month (all FY combined)",
+                              height=400, yaxis_title="Avg Diversion (T)")
+    st.plotly_chart(fig_season, use_container_width=True)
+
+    st.markdown('<div class="section-title">3-Month Moving Average Trend</div>', unsafe_allow_html=True)
+    ma_df = f_dm.groupby(["FY", "MonthIdx"], observed=True, as_index=False)["Value"].sum()
+    ma_df = ma_df.sort_values(["FY", "MonthIdx"]).reset_index(drop=True)
+    ma_df["MA3"] = ma_df["Value"].rolling(3, min_periods=1).mean()
+    ma_df["Idx"] = range(len(ma_df))
+    fig_ma = go.Figure()
+    fig_ma.add_trace(go.Scatter(x=ma_df["Idx"], y=ma_df["Value"], name="Actual",
+                                 mode="lines+markers", line=dict(color="#B7C6DA")))
+    fig_ma.add_trace(go.Scatter(x=ma_df["Idx"], y=ma_df["MA3"], name="3-Month Moving Avg",
+                                 mode="lines", line=dict(color=ACCENT, width=3)))
+    fig_ma.update_layout(template="plotly_white", height=400, title="Diversion Trend Smoothing",
+                          xaxis_title="Timeline (sequential months)", yaxis_title="Diversion (T)")
+    st.plotly_chart(fig_ma, use_container_width=True)
+
+# ------------------------------------------------------------------ TAB 6 ---
+with tab6:
+    st.markdown('<div class="section-title">Filtered Raw Data</div>', unsafe_allow_html=True)
+    ds = st.selectbox("Choose dataset to view / export",
+                       ["Customer-Month Production Volume", "Customer Totals & Diversion %",
+                        "Customer-Defect Matrix (Diversion)", "Defect-Month Matrix (Diversion)"])
+    mapping = {
+        "Customer-Month Production Volume": f_month,
+        "Customer Totals & Diversion %": f_totals,
+        "Customer-Defect Matrix (Diversion)": f_cd,
+        "Defect-Month Matrix (Diversion)": f_dm,
+    }
+    show_df = mapping[ds]
+    st.dataframe(show_df, use_container_width=True, height=460)
+    csv = show_df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download this table as CSV", data=csv,
+                        file_name=f"{ds.replace(' ', '_').lower()}.csv", mime="text/csv")
+
+st.markdown(
+    '<div style="text-align:center;color:#8A94A6;font-size:12.5px;margin-top:20px;">'
+    'Narrow Diversion Quality Dashboard • Naval Department, Tata Steel • '
+    'Built with Streamlit & Plotly</div>', unsafe_allow_html=True)
